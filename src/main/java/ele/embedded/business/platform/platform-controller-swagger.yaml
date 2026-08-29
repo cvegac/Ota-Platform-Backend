@@ -1,0 +1,329 @@
+openapi: 3.0.1
+info:
+  title: Platform API
+  description: API de gestión de plataformas, proyectos, grupos y dispositivos.
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080/platform
+paths:
+  /project/{projectId}/group/{groupId}/devices:
+    get:
+      summary: Obtener todos los dispositivos de un grupo
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: groupId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Lista de dispositivos
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DeviceDTO'
+  /project/{projectId}/group/{groupId}/device:
+    post:
+      summary: Crear un dispositivo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceDTO'
+      responses:
+        '200':
+          description: Archivo ZIP con certificados
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+  /projects/groups:
+    get:
+      summary: Obtener todos los tipos de dispositivos (grupos)
+      responses:
+        '200':
+          description: Lista de tipos de dispositivos
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DeviceTypeEntity'
+  /project/{projectId}/groups:
+    get:
+      summary: Obtener los grupos de un proyecto
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Lista de grupos
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DeviceTypeEntity'
+  /project/{projectId}/group:
+    post:
+      summary: Crear un grupo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceTypeDTO'
+      responses:
+        '200':
+          description: Grupo creado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceTypeDTO'
+  /projects:
+    get:
+      summary: Obtener todos los proyectos
+      responses:
+        '200':
+          description: Lista de proyectos
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProjectEntity'
+  /project:
+    post:
+      summary: Crear un proyecto
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectRequest'
+      responses:
+        '200':
+          description: Proyecto creado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectResponse'
+  /project/{projectId}/group/{groupId}/firmware/presigned-url:
+    post:
+      summary: Generar URL prefirmada para firmware de grupo
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: groupId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: URL prefirmada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  presignedUrl:
+                    type: string
+  /project/{projectId}/group/{groupId}/device/{deviceId}/firmware/presigned-url:
+    post:
+      summary: Generar URL prefirmada para firmware de dispositivo
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: groupId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: deviceId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: URL prefirmada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  presignedUrl:
+                    type: string
+  /project/{projectId}/group/{groupId}/firmware/job/update:
+    post:
+      summary: Lanzar actualización de firmware para grupo
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: groupId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                versionId:
+                  type: string
+      responses:
+        '200':
+          description: Actualización lanzada
+  /project/{projectId}/group/{groupId}/device/{deviceId}/firmware/job/update:
+    post:
+      summary: Lanzar actualización de firmware para dispositivo
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: groupId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: deviceId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                versionId:
+                  type: string
+      responses:
+        '200':
+          description: Actualización lanzada
+  /project/{projectId}/group/{groupId}/firmware/versions:
+    get:
+      summary: Obtener versiones de firmware de un grupo
+      parameters:
+        - name: projectId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: groupId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Versiones de firmware
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupVersionsResponse'
+components:
+  schemas:
+    DeviceDTO:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        # ...otros campos...
+    DeviceTypeEntity:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        # ...otros campos...
+    DeviceTypeDTO:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        # ...otros campos...
+    ProjectEntity:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        # ...otros campos...
+    ProjectRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        # ...otros campos...
+    ProjectResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        # ...otros campos...
+    GroupVersionsResponse:
+      type: object
+      properties:
+        versions:
+          type: array
+          items:
+            type: string
+        # ...otros campos...

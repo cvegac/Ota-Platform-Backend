@@ -1,0 +1,762 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  OTA Platform - infraestructura del recuadro superior de la Figura 8.1.
+  VPC con subredes publicas/privadas, ALB internet-facing, Auto Scaling Group
+  para FrontEnd (NGINX) y para BackEnd (Spring Boot), RDS PostgreSQL en subred
+  privada con alias Route53, bucket de artefactos para los pipelines.
+  Region objetivo: us-east-2 (misma que S3 ota-binaries-bucket, IoT y Lambda).
+
+# ---------------------------------------------------------------------------
+# PARAMETERS
+# ---------------------------------------------------------------------------
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: ota
+    Description: Prefijo para nombrar y taggear los recursos.
+
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.20.0.0/24
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.20.1.0/24
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.20.10.0/24
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.20.11.0/24
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AMI de Amazon Linux 2023 (resuelta via SSM, no tocar).
+
+  KeyPairName:
+    Type: String
+    Default: ""
+    Description: (Opcional) key pair para SSH de debug. Vacio = sin llave, se accede por SSM Session Manager.
+
+  DBName:
+    Type: String
+    Default: app_db
+  DBUsername:
+    Type: String
+    Default: app_admin
+  DBEngineVersion:
+    Type: String
+    Default: "16.9"
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+
+  PrivateHostedZoneName:
+    Type: String
+    Default: ota.internal
+    Description: Zona DNS privada donde se crea el alias de la RDS.
+
+  OtaBinariesBucketName:
+    Type: String
+    Default: ota-binaries-bucket
+    Description: Bucket ya existente de binarios de firmware (solo se referencia en el IAM role).
+
+  BackendArtifactKey:
+    Type: String
+    Default: backend/app.jar
+  FrontendArtifactKey:
+    Type: String
+    Default: frontend/dist.zip
+
+  SSLCertificateArn:
+    Type: String
+    Default: ""
+    Description: (Opcional) ARN de un certificado ACM para habilitar HTTPS (443) en el ALB.
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, ""]]
+  HasTLS: !Not [!Equals [!Ref SSLCertificateArn, ""]]
+
+# ---------------------------------------------------------------------------
+# RESOURCES
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ------------------------- NETWORK -------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-vpc" }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-igw" }
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-public-1" }
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-public-2" }
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-private-1" }
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-private-2" }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-public-rt" }
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-nat" }
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-private-rt" }
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+  PrivateSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  # S3 gateway endpoint: descarga de artefactos sin pasar por el NAT
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+        - !Ref PublicRouteTable
+
+  # ------------------------- SECURITY GROUPS -------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB publico - entrada web y API
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: HTTP web+api }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: 0.0.0.0/0, Description: API directa (venta como API) }
+        - !If
+          - HasTLS
+          - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTPS }
+          - !Ref AWS::NoValue
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-alb-sg" }
+
+  FrontendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: FrontEnd NGINX - solo desde el ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-frontend-sg" }
+
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: BackEnd Spring Boot - solo desde el ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-backend-sg" }
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS PostgreSQL - solo desde el BackEnd
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BackendSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-db-sg" }
+
+  # ------------------------- ARTIFACTS BUCKET -------------------------
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${EnvironmentName}-deploy-artifacts-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-artifact-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+  # ------------------------- APP SECRETS -------------------------
+  JwtSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub "${EnvironmentName}/jwt-private-key"
+      Description: Clave privada para firmar los JWT del BackEnd
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+
+  # ------------------------- IAM -------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-instance-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: deploy-artifacts-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub "${ArtifactsBucket.Arn}/*"
+        - PolicyName: rds-secret-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource:
+                  - !GetAtt DBInstance.MasterUserSecret.SecretArn
+                  - !Ref JwtSecret
+        - PolicyName: backend-runtime-aws-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource:
+                  - !Sub "arn:aws:s3:::${OtaBinariesBucketName}"
+                  - !Sub "arn:aws:s3:::${OtaBinariesBucketName}/*"
+              - Effect: Allow
+                Action:
+                  - iot:*
+                  - acm:ListCertificates
+                  - acm:DescribeCertificate
+                  - acm:GetCertificate
+                  - signer:*
+                  - lambda:InvokeFunction
+                Resource: "*"
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-instance-role" }
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${EnvironmentName}-instance-profile"
+      Roles: [!Ref InstanceRole]
+
+  # ------------------------- LOAD BALANCER -------------------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${EnvironmentName}-alb"
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-alb" }
+
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-frontend-tg"
+      VpcId: !Ref Vpc
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 4
+      Matcher: { HttpCode: "200-399" }
+
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-backend-tg"
+      VpcId: !Ref Vpc
+      Port: 8080
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 4
+      # El backend ya tiene spring-boot-starter-actuator: /actuator/health -> 200 sin auth.
+      Matcher: { HttpCode: "200" }
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTargetGroup
+
+  # El frontend llama al backend por el mismo host (/api, /auth, ...) => sin CORS.
+  # ALB limita a 5 patrones por condicion => se parten en dos reglas.
+  BackendPathRule1:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: [/api/*, /auth/*, /platform/*, /iot/*, /s3/*]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  BackendPathRule2:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpListener
+      Priority: 11
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: [/lambda/*, /actuator/*]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  # Listener dedicado en :8080 => backend como API vendible, acceso directo.
+  ApiListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 8080
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  HttpsListener:
+    Condition: HasTLS
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref SSLCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTargetGroup
+
+  HttpsBackendPathRule1:
+    Condition: HasTLS
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: [/api/*, /auth/*, /platform/*, /iot/*, /s3/*]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  HttpsBackendPathRule2:
+    Condition: HasTLS
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 11
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: [/lambda/*, /actuator/*]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  # ------------------------- RDS -------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${EnvironmentName} RDS subnets (privadas)"
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "${EnvironmentName}-platform"
+      Engine: postgres
+      EngineVersion: !Ref DBEngineVersion
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUsername
+      ManageMasterUserPassword: true
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref DBSecurityGroup]
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+      EnablePerformanceInsights: false
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-platform-rds" }
+
+  PrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref PrivateHostedZoneName
+      VPCs:
+        - VPCId: !Ref Vpc
+          VPCRegion: !Ref AWS::Region
+
+  # Alias estable para la RDS: db.ota.internal -> endpoint real
+  DBAliasRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: !Sub "db.${PrivateHostedZoneName}"
+      Type: CNAME
+      TTL: "60"
+      ResourceRecords:
+        - !GetAtt DBInstance.Endpoint.Address
+
+  # ------------------------- LAUNCH TEMPLATES -------------------------
+  BackendLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${EnvironmentName}-backend-lt"
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref "AWS::NoValue"]
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!Ref BackendSecurityGroup]
+        MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${EnvironmentName}-backend" }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf -y install java-21-amazon-corretto-headless jq unzip
+            # aws-cli v2 ya viene preinstalada en Amazon Linux 2023
+
+            APP_DIR=/opt/app
+            mkdir -p "$APP_DIR"
+            aws s3 cp "s3://${ArtifactsBucket}/${BackendArtifactKey}" "$APP_DIR/app.jar" --region ${AWS::Region}
+
+            SECRET_ARN='${DBInstance.MasterUserSecret.SecretArn}'
+            SECRET=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --query SecretString --output text --region ${AWS::Region})
+            DB_USER=$(echo "$SECRET" | jq -r .username)
+            DB_PASS=$(echo "$SECRET" | jq -r .password)
+            DB_HOST='db.${PrivateHostedZoneName}'
+
+            JWT_KEY=$(aws secretsmanager get-secret-value --secret-id '${JwtSecret}' --query SecretString --output text --region ${AWS::Region})
+
+            cat >/etc/app.env <<EOF
+            DB_URL=jdbc:postgresql://$DB_HOST:5432/${DBName}
+            DB_USERNAME=$DB_USER
+            DB_PASSWORD=$DB_PASS
+            JWT_PRIVATE_KEY=$JWT_KEY
+            AWS_REGION=${AWS::Region}
+            OTA_BINARIES_BUCKET=${OtaBinariesBucketName}
+            EOF
+            chmod 600 /etc/app.env
+
+            cat >/etc/systemd/system/app.service <<'EOF'
+            [Unit]
+            Description=OTA BackEnd (Spring Boot)
+            After=network-online.target
+            [Service]
+            EnvironmentFile=/etc/app.env
+            ExecStart=/usr/bin/java -jar /opt/app/app.jar
+            Restart=always
+            RestartSec=5
+            User=root
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            systemctl daemon-reload
+            systemctl enable --now app.service
+
+  FrontendLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${EnvironmentName}-frontend-lt"
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref "AWS::NoValue"]
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!Ref FrontendSecurityGroup]
+        MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${EnvironmentName}-frontend" }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf -y install nginx unzip
+
+            aws s3 cp "s3://${ArtifactsBucket}/${FrontendArtifactKey}" /tmp/dist.zip --region ${AWS::Region}
+            rm -rf /usr/share/nginx/html
+            mkdir -p /usr/share/nginx/html
+            unzip -o /tmp/dist.zip -d /tmp/dist
+            # El build de Angular deja los archivos en dist/platform/browser
+            SRC=$(dirname "$(find /tmp/dist -name index.html | head -n1)")
+            cp -r "$SRC"/. /usr/share/nginx/html/
+
+            cat >/etc/nginx/conf.d/app.conf <<'EOF'
+            server {
+              listen 80 default_server;
+              server_name _;
+              root /usr/share/nginx/html;
+              index index.html;
+              location / { try_files $uri $uri/ /index.html; }
+            }
+            EOF
+            rm -f /etc/nginx/nginx.conf.default
+            nginx -t
+            systemctl enable --now nginx
+
+  # ------------------------- AUTO SCALING GROUPS -------------------------
+  BackendAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: false
+    Properties:
+      AutoScalingGroupName: !Sub "${EnvironmentName}-backend-asg"
+      VPCZoneIdentifier: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref BackendLaunchTemplate
+        Version: !GetAtt BackendLaunchTemplate.LatestVersionNumber
+      MinSize: "1"
+      MaxSize: "3"
+      DesiredCapacity: "1"
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      TargetGroupARNs: [!Ref BackendTargetGroup]
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-backend", PropagateAtLaunch: true }
+
+  FrontendAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: false
+    Properties:
+      AutoScalingGroupName: !Sub "${EnvironmentName}-frontend-asg"
+      VPCZoneIdentifier: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref FrontendLaunchTemplate
+        Version: !GetAtt FrontendLaunchTemplate.LatestVersionNumber
+      MinSize: "1"
+      MaxSize: "3"
+      DesiredCapacity: "1"
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+      TargetGroupARNs: [!Ref FrontendTargetGroup]
+      Tags:
+        - { Key: Name, Value: !Sub "${EnvironmentName}-frontend", PropagateAtLaunch: true }
+
+  BackendScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref BackendAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification: { PredefinedMetricType: ASGAverageCPUUtilization }
+        TargetValue: 60.0
+
+  FrontendScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref FrontendAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification: { PredefinedMetricType: ASGAverageCPUUtilization }
+        TargetValue: 60.0
+
+# ---------------------------------------------------------------------------
+# OUTPUTS
+# ---------------------------------------------------------------------------
+Outputs:
+  AlbDnsName:
+    Description: DNS publico del Load Balancer (web + API en /api, /auth, ...)
+    Value: !GetAtt LoadBalancer.DNSName
+  WebUrl:
+    Description: URL de la plataforma web
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  ApiUrl:
+    Description: URL de la API directa (listener :8080)
+    Value: !Sub "http://${LoadBalancer.DNSName}:8080"
+  ArtifactsBucketName:
+    Description: Bucket para los artefactos de los pipelines
+    Value: !Ref ArtifactsBucket
+  BackendAsgName:
+    Value: !Ref BackendAutoScalingGroup
+  FrontendAsgName:
+    Value: !Ref FrontendAutoScalingGroup
+  DBAlias:
+    Description: Alias DNS estable de la RDS
+    Value: !Sub "db.${PrivateHostedZoneName}"
+  DBEndpoint:
+    Value: !GetAtt DBInstance.Endpoint.Address
+  DBSecretArn:
+    Description: Secret gestionado por RDS con user/pass
+    Value: !GetAtt DBInstance.MasterUserSecret.SecretArn

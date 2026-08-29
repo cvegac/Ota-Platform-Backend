@@ -1,0 +1,11 @@
+[
+  { "ParameterKey": "EnvironmentName", "ParameterValue": "ota" },
+  { "ParameterKey": "InstanceType", "ParameterValue": "t3.small" },
+  { "ParameterKey": "DBName", "ParameterValue": "app_db" },
+  { "ParameterKey": "DBUsername", "ParameterValue": "app_admin" },
+  { "ParameterKey": "DBInstanceClass", "ParameterValue": "db.t4g.micro" },
+  { "ParameterKey": "PrivateHostedZoneName", "ParameterValue": "ota.internal" },
+  { "ParameterKey": "OtaBinariesBucketName", "ParameterValue": "ota-binaries-bucket" },
+  { "ParameterKey": "KeyPairName", "ParameterValue": "" },
+  { "ParameterKey": "SSLCertificateArn", "ParameterValue": "" }
+]
